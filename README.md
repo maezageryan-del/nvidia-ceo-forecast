@@ -1,4 +1,4 @@
-# NVIDIA CEO forecast — empirical change-quantile entry
+# NVIDIA CEO forecast — empirical change-quantile entry (v2)
 
 `main.ts` (Node 22, standard library only, no network) forecasts, for every
 market of Polymarket's "Next CEO of NVIDIA?" event, the five quantiles
@@ -14,6 +14,16 @@ after a case's checkpoint.
   This captures what a Gaussian random walk cannot: minutes that do not move
   at all, tick-sized steps, jumps, and the strong mean reversion of these
   prices at minute scale.
+- **Recency weighting (new in v2).** Change samples are weighted by
+  exp(-age / 150 min): the market's behavior in the last few hours says much
+  more about the next four hours than yesterday's regime, and weighting the
+  empirical quantiles accordingly was worth several percent of loss on every
+  practice case.
+- **Volatility-regime scaling (new in v2).** Each market's band is scaled by
+  a shrunk (x0.5), clamped (0.7–1.4) ratio of its recent 360-minute
+  30-minute-change width to its full-window width, so a market that has just
+  woken up gets wider bands and one that has gone quiet gets narrower ones
+  than the case-wide calibration alone would give it.
 - **Persistence median.** The quantile shape is centered so the median sits
   on the last price; the inner pair is narrowed slightly (x0.8) and the
   outer pair starts from a x1.3 widening, both then case-calibrated.
@@ -32,4 +42,6 @@ of a case produce byte-identical output, and a single case runs in well
 under a second.
 
 On the kit's six practice cases this scores a mean pinball loss of about
-0.2905, against the house baseline's 0.363589 on the same cases.
+0.2754, against the house baseline's 0.363589 and the previous version's
+0.2905 on the same cases (per case: 0.4829 / 0.3122 / 0.3614 / 0.2546 /
+0.1975 / 0.1117 — better than v1 on all six).

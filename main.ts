@@ -1,14 +1,16 @@
-// polymarket-nvidia-ceo-forecast-01 entry: per-market empirical change quantiles.
+// polymarket-nvidia-ceo-forecast-01 entry v2: per-market empirical change
+// quantiles with recency-weighted estimation and per-market vol-regime scaling.
 //
-// Model: for each market, the distribution of the price change over h minutes is
-// estimated from the case's own history (trailing window of overlapping h-step
-// changes), at knot horizons, interpolated in sqrt(h). The shape is blended
-// toward the Gaussian baseline shape when a market has little history and
-// centered so the median sits on the (possibly reversion-adjusted) last price.
-// Band multipliers (short/long horizon), an outer-quantile widening and a
-// spike-reversion strength are calibrated per case by backtesting the same
-// estimator at pseudo-checkpoints inside the history, shrunk toward defaults.
-// Deterministic; standard library only.
+// Model: for each market, the distribution of the price change over h minutes
+// is estimated from the case's own history (trailing window of overlapping
+// h-step changes, exponentially recency-weighted with a 150-minute e-folding),
+// at knot horizons, interpolated in sqrt(h), and centered so the median sits
+// on the last price. Each market's band is also scaled by a shrunk, clamped
+// regime factor: the ratio of its recent (360 min) 30-minute change width to
+// its full-window width. Band multipliers (short/long horizon) and an
+// outer-quantile widening are calibrated per case by backtesting the same
+// estimator at pseudo-checkpoints inside the history. Deterministic;
+// standard library only.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -18,7 +20,7 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
 
-const CFG = {"mode":"emp","W":1080,"W2":0,"knots":[1,5,15,30,60,120,240],"calibrate":true,"calSplit":true,"splitH":90,"mGrid":[0.6,0.75,0.9,1,1.1,1.25,1.45,1.7,2],"tailGrid":[1,1.15,1.3,1.5],"revertGrid":[0],"calHorizons":[30,120,240],"calStep":240,"shrink":1,"tailShrink":1,"revertShrink":1,"baseSigma":0.0025,"sigmaFloor":0.0004,"sigmaCap":0.012,"centerMedian":true,"tailW":1.3,"innerW":0.8,"blendRamp":0,"minSamples":30,"debug":false};
+const CFG = {"mode":"emp","W":1080,"W2":0,"knots":[1,5,15,30,60,120,240],"calibrate":true,"calSplit":true,"splitH":90,"mGrid":[0.6,0.75,0.9,1,1.1,1.25,1.45,1.7,2],"tailGrid":[1,1.15,1.3,1.5],"revertGrid":[0],"calHorizons":[30,120,240],"calStep":240,"shrink":1,"tailShrink":1,"revertShrink":1,"baseSigma":0.0025,"sigmaFloor":0.0004,"sigmaCap":0.012,"centerMedian":true,"tailW":1.3,"innerW":0.8,"blendRamp":0,"minSamples":30,"debug":false,"wDecay":150,"regime":0.5,"regimeWin":360,"regimeH":30};
 
 interface CaseMarket { id: string; prices: number[]; }
 interface Case { horizon_minutes: number; quantiles: number[]; markets: CaseMarket[]; }
@@ -37,6 +39,28 @@ function quantileOf(sorted: Float64Array, tau: number): number {
   return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
 }
 
+/** Weighted quantile of sorted values with matching weights (midpoint rule). */
+function weightedQuantileOf(sorted: Float64Array, wts: Float64Array, tau: number): number {
+  const n = sorted.length;
+  if (n === 0) return 0;
+  if (n === 1) return sorted[0];
+  let total = 0;
+  for (let i = 0; i < n; i++) total += wts[i];
+  let cum = 0;
+  let prevU = 0, prevV = sorted[0];
+  for (let i = 0; i < n; i++) {
+    const u = (cum + wts[i] / 2) / total;
+    if (tau <= u) {
+      if (i === 0) return sorted[0];
+      const span = u - prevU;
+      return span > 0 ? prevV + (sorted[i] - prevV) * ((tau - prevU) / span) : sorted[i];
+    }
+    cum += wts[i];
+    prevU = u; prevV = sorted[i];
+  }
+  return sorted[n - 1];
+}
+
 function medianOf(values: number[]): number {
   const s = Float64Array.from(values).sort();
   return quantileOf(s, 0.5);
@@ -46,8 +70,9 @@ interface ChangeQ { q: number[]; count: number; }
 
 /**
  * Empirical quantiles of the h-step price changes whose windows end at or
- * before index `end`, using at most the last W change samples, plus the
- * sample count. Returns null when too few samples exist.
+ * before index `end`, using at most the last W change samples (optionally
+ * recency-weighted with exponential decay wDecay in minutes). Null when too
+ * few samples exist.
  */
 function changeQuantiles(prices: number[], end: number, h: number, W: number): ChangeQ | null {
   const lastStart = end - h;
@@ -59,6 +84,18 @@ function changeQuantiles(prices: number[], end: number, h: number, W: number): C
   for (let i = 0; i < count; i++) {
     const t = firstStart + i;
     changes[i] = prices[t + h] - prices[t];
+  }
+  if (CFG.wDecay > 0) {
+    const order = Array.from({ length: count }, (_, i) => i).sort((a, b) => changes[a] - changes[b]);
+    const sorted = new Float64Array(count);
+    const wts = new Float64Array(count);
+    for (let r = 0; r < count; r++) {
+      const i = order[r];
+      sorted[r] = changes[i];
+      const endIdx = firstStart + i + h; // change ends at this price index
+      wts[r] = Math.exp(-(end - endIdx) / CFG.wDecay);
+    }
+    return { q: QUANTILES.map((tau) => weightedQuantileOf(sorted, wts, tau)), count };
   }
   changes.sort();
   return { q: QUANTILES.map((tau) => quantileOf(changes, tau)), count };
@@ -112,13 +149,6 @@ function rawShape(prices: number[], end: number, h: number): number[] | null {
   return q;
 }
 
-/** Widen/narrow the outer (tailW) and inner (innerW) pairs around the median. */
-function spreadAdjust(shape: number[], tailW: number, innerW: number): number[] {
-  if (tailW === 1 && innerW === 1) return shape;
-  const med = shape[2];
-  return shape.map((v, t) => (t === 0 || t === 4 ? med + (v - med) * tailW : t === 2 ? v : med + (v - med) * innerW));
-}
-
 /** Interpolated raw shape at horizon h from knot shapes (sqrt scale). */
 function shapeAt(knotQ: (number[] | null)[], knots: number[], h: number): number[] | null {
   let below: { h: number; q: number[] } | null = null;
@@ -146,7 +176,7 @@ function directShape(m: CaseMarket, end: number, h: number): number[] {
   return gaussShape(marketSigma(m.prices.slice(0, end + 1), CFG.W), h);
 }
 
-/** Reversion anchor at index e: median price over [e-35, e-5]; falls back to p[e]. */
+/** Reversion anchor (short) at index e: median price over [e-35, e-5]. */
 function anchorAt(p: number[], e: number): number {
   const lo = Math.max(0, e - 35);
   const hi = e - 5;
@@ -154,19 +184,21 @@ function anchorAt(p: number[], e: number): number {
   return medianOf(p.slice(lo, hi + 1));
 }
 
-interface Cal { multAt: (h: number) => number; tailW: number; revertK: number; }
+interface Cal {
+  // multiplier applied to the (median-centered) deviation of quantile index t at horizon h
+  scaleAt: (h: number, t: number) => number;
+  revertK: number;
+}
 
-/**
- * Calibrate the case's band multiplier(s), tail widening and reversion
- * strength by backtesting the estimator at pseudo-checkpoints (only data up
- * to the checkpoint, realized moves after), scoring pinball over the
- * calibration horizons; shrink each toward its default.
- */
-function calibrate(markets: CaseMarket[]): Cal {
-  const plain = (): Cal => ({ multAt: () => 1, tailW: CFG.tailW, revertK: 0 });
-  if (!CFG.calibrate) return plain();
-  type Item = { x: number; anchor: number; y: number; h: number; shape: number[] };
-  const items: Item[] = [];
+function pinballItem(y: number, qq: number, t: number): number {
+  const d = y - qq;
+  return Math.max(QUANTILES[t] * d, (QUANTILES[t] - 1) * d);
+}
+
+interface CalItem { x: number; anchor: number; y: number; h: number; shape: number[]; }
+
+function collectItems(markets: CaseMarket[]): CalItem[] {
+  const items: CalItem[] = [];
   const maxH = CFG.calHorizons[CFG.calHorizons.length - 1];
   for (const m of markets) {
     const p = m.prices;
@@ -179,30 +211,41 @@ function calibrate(markets: CaseMarket[]): Cal {
       }
     }
   }
+  return items;
+}
+
+/**
+ * Calibrate per-case deviation scales by backtesting the estimator at
+ * pseudo-checkpoints inside the history (pinball loss): a (tail widening,
+ * reversion) outer loop with a per-horizon-bucket multiplier inner loop,
+ * each shrunk toward its default.
+ */
+function calibrate(markets: CaseMarket[]): Cal {
+  const plainScale = (t: number): number => (t === 0 || t === 4 ? CFG.tailW : t === 2 ? 1 : CFG.innerW);
+  const plain = (): Cal => ({ scaleAt: (_h, t) => plainScale(t), revertK: 0 });
+  if (!CFG.calibrate) return plain();
+  const items = collectItems(markets);
   if (items.length < 50) return plain();
-  const buckets: Item[][] = CFG.calSplit
+  const buckets: CalItem[][] = CFG.calSplit
     ? [items.filter((it) => it.h <= CFG.splitH), items.filter((it) => it.h > CFG.splitH)]
     : [items];
   if (buckets.some((b) => b.length === 0)) return plain();
   let bestLoss = Infinity;
   let bestM: number[] = buckets.map(() => 1);
-  let bestT = CFG.tailW, bestK = 0;
+  let bestT = CFG.tailW, bestK1 = 0;
   for (const tailW of CFG.tailGrid) {
     for (const k of CFG.revertGrid) {
-      // per bucket: adjusted shapes under this (tailW, k), then best multiplier
       let total = 0;
       const ms: number[] = [];
       for (const bucket of buckets) {
-        const adj = bucket.map((it) => spreadAdjust(it.shape, tailW, CFG.innerW));
-        const ctr = bucket.map((it) => it.x - k * (it.x - it.anchor));
         let bLoss = Infinity, bM = 1;
         for (const mult of CFG.mGrid) {
           let loss = 0;
-          for (let i = 0; i < bucket.length; i++) {
+          for (const it of bucket) {
+            const ctr = it.x - k * (it.x - it.anchor);
             for (let t = 0; t < 5; t++) {
-              const qq = clamp01(ctr[i] + mult * adj[i][t]);
-              const d = bucket[i].y - qq;
-              loss += Math.max(QUANTILES[t] * d, (QUANTILES[t] - 1) * d);
+              const adj = t === 0 || t === 4 ? it.shape[t] * tailW : t === 2 ? it.shape[t] : it.shape[t] * CFG.innerW;
+              loss += pinballItem(it.y, clamp01(ctr + mult * adj), t);
             }
           }
           if (loss < bLoss) { bLoss = loss; bM = mult; }
@@ -210,13 +253,13 @@ function calibrate(markets: CaseMarket[]): Cal {
         total += bLoss;
         ms.push(bM);
       }
-      if (total < bestLoss) { bestLoss = total; bestM = ms; bestT = tailW; bestK = k; }
+      if (total < bestLoss) { bestLoss = total; bestM = ms; bestT = tailW; bestK1 = k; }
     }
   }
   const mS = 1 + CFG.shrink * (bestM[0] - 1);
   const mL = 1 + CFG.shrink * ((bestM[1] ?? bestM[0]) - 1);
   const tailW = CFG.tailW + CFG.tailShrink * (bestT - CFG.tailW);
-  const revertK = CFG.revertShrink * bestK;
+  const revertK = CFG.revertShrink * bestK1;
   const multAt = (h: number): number => {
     if (!CFG.calSplit) return mS;
     if (h <= CFG.splitH) return mS;
@@ -224,7 +267,25 @@ function calibrate(markets: CaseMarket[]): Cal {
     const w = (Math.sqrt(h) - Math.sqrt(CFG.splitH)) / (Math.sqrt(240) - Math.sqrt(CFG.splitH));
     return mS + (mL - mS) * w;
   };
-  return { multAt, tailW, revertK };
+  return {
+    scaleAt: (h, t) => multAt(h) * (t === 0 || t === 4 ? tailW : t === 2 ? 1 : CFG.innerW),
+    revertK,
+  };
+}
+
+/** Per-market vol-regime factor: recent change width vs window change width. */
+function regimeFactor(m: CaseMarket): number {
+  if (!CFG.regime) return 1;
+  const p = m.prices;
+  const end = p.length - 1;
+  const recent = changeQuantiles(p, end, CFG.regimeH, CFG.regimeWin);
+  const full = changeQuantiles(p, end, CFG.regimeH, CFG.W);
+  if (!recent || !full) return 1;
+  const wR = recent.q[3] - recent.q[1];
+  const wF = full.q[3] - full.q[1];
+  if (!(wF > 0)) return 1;
+  const ratio = Math.min(1.4, Math.max(0.7, wR / wF));
+  return 1 + CFG.regime * (ratio - 1);
 }
 
 function forecastMarket(m: CaseMarket, horizon: number, cal: Cal): number[][] {
@@ -234,14 +295,14 @@ function forecastMarket(m: CaseMarket, horizon: number, cal: Cal): number[][] {
   }
   const end = p.length - 1;
   const x = p[end] - cal.revertK * (p[end] - anchorAt(p, end));
+  const regF = regimeFactor(m);
   const knotQ = CFG.mode === 'emp' ? CFG.knots.map((h) => rawShape(p, end, h)) : null;
   const sigma = CFG.mode === 'gauss' ? CFG.baseSigma : marketSigma(p, CFG.W);
   const rows: number[][] = [];
   for (let h = 1; h <= horizon; h++) {
     let s: number[] | null = knotQ ? shapeAt(knotQ, CFG.knots, h) : null;
     if (!s) s = gaussShape(sigma, h);
-    const adj = spreadAdjust(s, cal.tailW, CFG.innerW);
-    const row = adj.map((v) => price6(x + cal.multAt(h) * v));
+    const row = s.map((v, t) => price6(x + cal.scaleAt(h, t) * regF * v));
     for (let t = 1; t < 5; t++) if (row[t] < row[t - 1]) row[t] = row[t - 1];
     rows.push(row);
   }
@@ -257,7 +318,7 @@ for (const file of inputs) {
     throw new Error(`${file} asks for quantiles ${JSON.stringify(c.quantiles)}, not ${JSON.stringify(QUANTILES)}`);
   }
   const cal = calibrate(c.markets);
-  if (CFG.debug) console.error(`${id}: tailW ${cal.tailW.toFixed(2)} revertK ${cal.revertK.toFixed(2)}`);
+  if (CFG.debug) console.error(`${id}: revertK ${cal.revertK.toFixed(2)}`);
   const forecasts = c.markets.map((m) => ({ id: m.id, q: forecastMarket(m, c.horizon_minutes, cal) }));
   writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts })}\n`);
 }
